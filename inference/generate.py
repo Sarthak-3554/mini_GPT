@@ -70,14 +70,21 @@ def generate(
     temperature=0.8,
     top_k=50,
 ):
+    device = next(model.parameters()).device
 
-    device = next(
-        model.parameters()
-    ).device
+    # --------------------------------------------------------
+    # Use the same format used during SFT
+    # --------------------------------------------------------
+    formatted_prompt = (
+        "<|user|>\n"
+        + prompt
+        + "\n"
+        + "<|assistant|>\n"
+    )
 
     # Encode prompt
     token_ids = tokenizer.encode(
-        prompt
+        formatted_prompt
     )
 
     idx = torch.tensor(
@@ -98,13 +105,13 @@ def generate(
             idx_cond
         )
 
-        # We only care about the last position
+        # Last token's prediction
         logits = logits[:, -1, :]
 
         # Temperature
         logits = logits / temperature
 
-        # Top-k filtering
+        # Top-k sampling
         if top_k is not None:
 
             values, _ = torch.topk(
@@ -118,12 +125,12 @@ def generate(
                 logits < threshold,
                 torch.full_like(
                     logits,
-                    float("-inf")
+                    float("-inf"),
                 ),
                 logits,
             )
 
-        # Convert logits → probabilities
+        # Probabilities
         probabilities = torch.softmax(
             logits,
             dim=-1,
@@ -135,13 +142,13 @@ def generate(
             num_samples=1,
         )
 
-        # Append token
+        # Append
         idx = torch.cat(
             [idx, next_token],
             dim=1,
         )
 
-        # Stop at EOS
+        # EOS
         if (
             tokenizer.eos_token_id is not None
             and next_token.item()
@@ -149,9 +156,17 @@ def generate(
         ):
             break
 
-    # Decode complete sequence
+    # Decode only the generated sequence.
+    #
+    # The prompt is already known, so we don't need
+    # to return it again.
+    generated_tokens = idx[
+        0,
+        len(token_ids):,
+    ].tolist()
+
     return tokenizer.decode(
-        idx[0].tolist()
+        generated_tokens
     )
 
 
@@ -210,9 +225,15 @@ def main():
         device,
     )
 
-    print(
-        f"Prompt: {args.prompt}"
-    )
+    print(f"Prompt: {args.prompt}")
+
+    print("\nFormatted prompt:")
+
+    print("<|user|>")
+
+    print(args.prompt)
+
+    print("<|assistant|>")
 
     output = generate(
         model=model,
