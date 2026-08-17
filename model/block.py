@@ -1,0 +1,51 @@
+import torch.nn as nn
+
+from .rmsnorm import RMSNorm
+from .attention import GroupedQueryAttention
+from .swiglu import SwiGLU
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.attention_norm = RMSNorm(
+            config.n_embd
+        )
+
+        self.attention = GroupedQueryAttention(
+            config
+        )
+
+        self.ffn_norm = RMSNorm(
+            config.n_embd
+        )
+
+        # Common approximation for SwiGLU hidden dimension.
+        hidden_dim = int(
+            8 * config.n_embd / 3
+        )
+
+        # Round to a multiple of 256
+        hidden_dim = (
+            (hidden_dim + 255) // 256
+        ) * 256
+
+        self.ffn = SwiGLU(
+            config.n_embd,
+            hidden_dim
+        )
+
+    def forward(self, x):
+
+        # Pre-normalization
+        x = x + self.attention(
+            self.attention_norm(x)
+        )
+
+        # Feed-forward network
+        x = x + self.ffn(
+            self.ffn_norm(x)
+        )
+
+        return x
