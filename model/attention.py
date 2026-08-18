@@ -1,3 +1,158 @@
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+
+# from .rope import precompute_rope, apply_rope
+
+
+# class GroupedQueryAttention(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+
+#         assert config.n_embd % config.n_head == 0
+#         assert config.n_head % config.n_kv_head == 0
+
+#         self.n_head = config.n_head
+#         self.n_kv_head = config.n_kv_head
+#         self.head_dim = config.n_embd // config.n_head
+
+#         self.n_rep = config.n_head // config.n_kv_head
+
+#         # Query projection
+#         self.q_proj = nn.Linear(
+#             config.n_embd,
+#             config.n_head * self.head_dim,
+#             bias=False
+#         )
+
+#         # Key and Value projections use fewer heads
+#         self.k_proj = nn.Linear(
+#             config.n_embd,
+#             config.n_kv_head * self.head_dim,
+#             bias=False
+#         )
+
+#         self.v_proj = nn.Linear(
+#             config.n_embd,
+#             config.n_kv_head * self.head_dim,
+#             bias=False
+#         )
+
+#         # Output projection
+#         self.out_proj = nn.Linear(
+#             config.n_embd,
+#             config.n_embd,
+#             bias=False
+#         )
+
+#         self.dropout = config.dropout
+
+#         # Precompute RoPE frequencies
+#         cos, sin = precompute_rope(
+#             config.block_size,
+#             self.head_dim,
+#             device="cpu"
+#         )
+
+#         self.register_buffer("rope_cos", cos, persistent=False)
+#         self.register_buffer("rope_sin", sin, persistent=False)
+
+#     def forward(self, x):
+#         B, T, C = x.shape
+
+#         # --------------------------------------------------
+#         # Project Q, K, V
+#         # --------------------------------------------------
+
+#         q = self.q_proj(x)
+#         k = self.k_proj(x)
+#         v = self.v_proj(x)
+
+#         # [B, T, H*D] -> [B, H, T, D]
+
+#         q = q.view(
+#             B, T,
+#             self.n_head,
+#             self.head_dim
+#         ).transpose(1, 2)
+
+#         k = k.view(
+#             B, T,
+#             self.n_kv_head,
+#             self.head_dim
+#         ).transpose(1, 2)
+
+#         v = v.view(
+#             B, T,
+#             self.n_kv_head,
+#             self.head_dim
+#         ).transpose(1, 2)
+
+#         # --------------------------------------------------
+#         # Rotary positional embeddings
+#         # --------------------------------------------------
+
+#         cos = self.rope_cos[:T].to(x.device)
+#         sin = self.rope_sin[:T].to(x.device)
+
+#         q, k = apply_rope(q, k, cos, sin)
+
+#         # --------------------------------------------------
+#         # GQA
+#         # --------------------------------------------------
+
+#         # Example:
+#         #
+#         # 8 query heads
+#         # 2 KV heads
+#         #
+#         # Each KV head is shared by 4 query heads.
+
+#         if self.n_rep > 1:
+#             k = k.repeat_interleave(
+#                 self.n_rep,
+#                 dim=1
+#             )
+
+#             v = v.repeat_interleave(
+#                 self.n_rep,
+#                 dim=1
+#             )
+
+#         # --------------------------------------------------
+#         # Causal self-attention
+#         # --------------------------------------------------
+
+#         # PyTorch's scaled_dot_product_attention:
+#         #
+#         # softmax(QK^T / sqrt(d)) V
+#         #
+#         # is_causal=True prevents looking at future tokens.
+
+#         y = F.scaled_dot_product_attention(
+#             q,
+#             k,
+#             v,
+#             attn_mask=None,
+#             dropout_p=self.dropout if self.training else 0.0,
+#             is_causal=True
+#         )
+
+#         # [B, H, T, D]
+#         # ->
+#         # [B, T, H*D]
+
+#         y = y.transpose(1, 2).contiguous()
+
+#         y = y.view(
+#             B,
+#             T,
+#             C
+#         )
+
+#         return self.out_proj(y)
+
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +161,7 @@ from .rope import precompute_rope, apply_rope
 
 
 class GroupedQueryAttention(nn.Module):
+
     def __init__(self, config):
         super().__init__()
 
@@ -16,7 +172,9 @@ class GroupedQueryAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.head_dim = config.n_embd // config.n_head
 
-        self.n_rep = config.n_head // config.n_kv_head
+        self.n_rep = (
+            config.n_head // config.n_kv_head
+        )
 
         # Query projection
         self.q_proj = nn.Linear(
@@ -25,13 +183,14 @@ class GroupedQueryAttention(nn.Module):
             bias=False
         )
 
-        # Key and Value projections use fewer heads
+        # Key projection
         self.k_proj = nn.Linear(
             config.n_embd,
             config.n_kv_head * self.head_dim,
             bias=False
         )
 
+        # Value projection
         self.v_proj = nn.Linear(
             config.n_embd,
             config.n_kv_head * self.head_dim,
@@ -47,102 +206,193 @@ class GroupedQueryAttention(nn.Module):
 
         self.dropout = config.dropout
 
-        # Precompute RoPE frequencies
+        # RoPE
         cos, sin = precompute_rope(
             config.block_size,
             self.head_dim,
             device="cpu"
         )
 
-        self.register_buffer("rope_cos", cos, persistent=False)
-        self.register_buffer("rope_sin", sin, persistent=False)
+        self.register_buffer(
+            "rope_cos",
+            cos,
+            persistent=False
+        )
 
-    def forward(self, x):
+        self.register_buffer(
+            "rope_sin",
+            sin,
+            persistent=False
+        )
+
+    def forward(
+        self,
+        x,
+        past_kv=None,
+        use_cache=False,
+        start_pos=0,
+    ):
+
         B, T, C = x.shape
 
-        # --------------------------------------------------
+        # ====================================================
         # Project Q, K, V
-        # --------------------------------------------------
+        # ====================================================
 
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        # [B, T, H*D] -> [B, H, T, D]
+        # [B, T, H*D]
+        # ->
+        # [B, H, T, D]
 
         q = q.view(
-            B, T,
+            B,
+            T,
             self.n_head,
             self.head_dim
         ).transpose(1, 2)
 
         k = k.view(
-            B, T,
+            B,
+            T,
             self.n_kv_head,
             self.head_dim
         ).transpose(1, 2)
 
         v = v.view(
-            B, T,
+            B,
+            T,
             self.n_kv_head,
             self.head_dim
         ).transpose(1, 2)
 
-        # --------------------------------------------------
-        # Rotary positional embeddings
-        # --------------------------------------------------
+        # ====================================================
+        # RoPE
+        # ====================================================
 
-        cos = self.rope_cos[:T].to(x.device)
-        sin = self.rope_sin[:T].to(x.device)
+        cos = self.rope_cos[
+            start_pos:start_pos + T
+        ].to(x.device)
 
-        q, k = apply_rope(q, k, cos, sin)
+        sin = self.rope_sin[
+            start_pos:start_pos + T
+        ].to(x.device)
 
-        # --------------------------------------------------
-        # GQA
-        # --------------------------------------------------
-
-        # Example:
-        #
-        # 8 query heads
-        # 2 KV heads
-        #
-        # Each KV head is shared by 4 query heads.
-
-        if self.n_rep > 1:
-            k = k.repeat_interleave(
-                self.n_rep,
-                dim=1
-            )
-
-            v = v.repeat_interleave(
-                self.n_rep,
-                dim=1
-            )
-
-        # --------------------------------------------------
-        # Causal self-attention
-        # --------------------------------------------------
-
-        # PyTorch's scaled_dot_product_attention:
-        #
-        # softmax(QK^T / sqrt(d)) V
-        #
-        # is_causal=True prevents looking at future tokens.
-
-        y = F.scaled_dot_product_attention(
+        q, k = apply_rope(
             q,
             k,
-            v,
-            attn_mask=None,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=True
+            cos,
+            sin
         )
 
-        # [B, H, T, D]
-        # ->
-        # [B, T, H*D]
+        # ====================================================
+        # KV CACHE
+        # ====================================================
 
-        y = y.transpose(1, 2).contiguous()
+        if past_kv is not None:
+
+            past_k, past_v = past_kv
+
+            k = torch.cat(
+                [past_k, k],
+                dim=2
+            )
+
+            v = torch.cat(
+                [past_v, v],
+                dim=2
+            )
+
+        present_kv = None
+
+        if use_cache:
+
+            # IMPORTANT:
+            # Store KV before GQA repetition.
+            #
+            # This keeps the cache smaller.
+
+            present_kv = (
+                k,
+                v
+            )
+
+        # ====================================================
+        # GQA
+        # ====================================================
+
+        if self.n_rep > 1:
+
+            k_attn = k.repeat_interleave(
+                self.n_rep,
+                dim=1
+            )
+
+            v_attn = v.repeat_interleave(
+                self.n_rep,
+                dim=1
+            )
+
+        else:
+
+            k_attn = k
+            v_attn = v
+
+        # ====================================================
+        # Attention
+        # ====================================================
+
+        if past_kv is None:
+
+            # Original behavior.
+            #
+            # This is used for:
+            # - training
+            # - initial prompt processing
+
+            y = F.scaled_dot_product_attention(
+                q,
+                k_attn,
+                v_attn,
+                attn_mask=None,
+                dropout_p=(
+                    self.dropout
+                    if self.training
+                    else 0.0
+                ),
+                is_causal=True
+            )
+
+        else:
+
+            # Cached generation.
+            #
+            # q contains ONLY the new token.
+            # K/V contain the entire history.
+
+            y = F.scaled_dot_product_attention(
+                q,
+                k_attn,
+                v_attn,
+                attn_mask=None,
+                dropout_p=(
+                    self.dropout
+                    if self.training
+                    else 0.0
+                ),
+                is_causal=False
+            )
+
+        # ====================================================
+        # Output projection
+        # ====================================================
+
+        y = y.transpose(
+            1,
+            2
+        ).contiguous()
 
         y = y.view(
             B,
@@ -150,4 +400,6 @@ class GroupedQueryAttention(nn.Module):
             C
         )
 
-        return self.out_proj(y)
+        y = self.out_proj(y)
+
+        return y, present_kv
